@@ -114,8 +114,15 @@ class DeltaExport(
         var shouldAdd = false
         node.attributes.forEach { att -> element.setAttribute(att.key, att.value.last().newValue) }
         node.valueVersions.forEach { version ->
-            if (version.fileName == fileName) {
-                if (!(version.newValue == "" && version.previousVersion == null && !includeNewEmptyFields)) {
+            if (version.fileName == fileName || (isArrayElement(node) && isAnyArrayElementChangedInThisFile(
+                    node,
+                    fileName
+                ))
+            ) {
+                val parentNode = node.parentNode
+                if (!(version.newValue == "" && version.previousVersion == null && !includeNewEmptyFields)
+                    || isArrayElement(node) || (parentNode != null && isArrayElement(parentNode) && node.attributes.isNotEmpty())
+                ) {
                     element.textContent = version.newValue
                     shouldAdd = true
                 }
@@ -133,6 +140,34 @@ class DeltaExport(
         if (shouldAdd) parent.appendChild(element)
 
         return shouldAdd
+    }
+
+    /**
+     * Check if the current node is part of an array.
+     */
+    private fun isArrayElement(node: Node): Boolean {
+        val parentNode = node.parentNode
+        if (parentNode != null && parentNode.children.size > 1) {
+            val firstChildName = parentNode.children[0].name
+            return parentNode.children.all { childNode -> childNode.name == firstChildName }
+        }
+
+        return false
+    }
+
+    /**
+     * Check if any element in the current array was changed/added as part of the file name passed in. Assumes an array.
+     */
+    private fun isAnyArrayElementChangedInThisFile(node: Node, fileName: String): Boolean {
+        val parentNode = node.parentNode
+        if (parentNode != null) {
+            return parentNode.children.any { childNode ->
+                childNode.valueVersions
+                    .any { version -> version.fileName == fileName }
+            }
+        }
+
+        return false
     }
 
 }
