@@ -1,5 +1,8 @@
 package com.gavinflood.compare
 
+import com.gavinflood.compare.domain.AdminData
+import com.gavinflood.compare.domain.Node
+import com.gavinflood.compare.domain.Version
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import java.io.File
@@ -9,56 +12,51 @@ import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
 
-/**
- * Exports the delta files for the admin data.
- *
- * @param directoryPath The directory to export the delta files to
- * @param adminData The admin data structure that contains the history of the entries
- * @param includeNewEmptyFields If true, new fields that were not on the previous version of the element will be
- *                              included in the delta, even if they have a value of null
- */
 class DeltaExport(
-    private val directoryPath: String, private val adminData: AdminData,
-    private val includeNewEmptyFields: Boolean
+    private val directoryPath: String,
+    private val adminData: AdminData,
+    private val baseFileName: String
 ) {
 
-    // Map with the key being the file name and the value being another map of the nodes changed by that file and their
-    // public-ids
-    private val changeFiles = mutableMapOf<String, MutableMap<String, Node>>()
+    // Key is the file name. Value is a map with the value being an import entity and the key being its public-id
+    private var fileChangesStore = mutableMapOf<String, MutableMap<String, Node>>()
 
     /**
      * Export the files.
      */
     fun export() {
-        populateChangeFiles()
-        changeFiles.forEach { changesForFile -> createDeltaFile(changesForFile.key, changesForFile.value) }
-        print("Finished delta export")
+        println("Start: Exporting delta files")
+
+        populateFileChangesStore()
+        fileChangesStore.forEach { createDeltaFile(it.key, it.value) }
+
+        println("Complete: Exporting delta files")
     }
 
     /**
-     * Iterates over the root nodes and populates the map with the changes made for each of them.
+     * Iterates over the entities and populates the map with the changes made for each of them.
      */
-    private fun populateChangeFiles() {
-        adminData.importItems.forEach { importItem -> populateChangeFilesFromNode(importItem.key, importItem.value) }
+    private fun populateFileChangesStore() {
+        adminData.entities.forEach { populateStoreWithNodeChanges(it.key, it.value) }
     }
 
     /**
      * Goes through the different values this node has had and adds entries to the changeFiles map. Also recursively
      * calls itself for each child node the current node has to add their changes to the map as well.
      *
-     * @param id The identifier for the node
+     * @param publicId The identifier for the node
      * @param node The node to check for changes on and populate the map accordingly
      */
-    private fun populateChangeFilesFromNode(id: String, node: Node) {
-        node.valueVersions.forEach { version ->
-            val existingNodesForFile = changeFiles[version.fileName] ?: mutableMapOf()
-            if (existingNodesForFile[id] == null) {
-                existingNodesForFile[id] = getRootNode(node)
+    private fun populateStoreWithNodeChanges(publicId: String, node: Node) {
+        node.versions.forEach { version ->
+            val entitiesUnderFile = fileChangesStore[version.fileName] ?: mutableMapOf()
+            if (entitiesUnderFile[publicId] == null) {
+                entitiesUnderFile[publicId] = getRootNode(node)
             }
-            changeFiles[version.fileName] = existingNodesForFile
+            fileChangesStore[version.fileName] = entitiesUnderFile
         }
 
-        node.children.forEach { childNode -> populateChangeFilesFromNode(id, childNode) }
+        node.children.forEach { populateStoreWithNodeChanges(publicId, it) }
     }
 
     /**
@@ -77,20 +75,32 @@ class DeltaExport(
      * Creates a single delta file.
      *
      * @param fileName The name of the file (based on the original file that made the changes)
-     * @param nodes A map where the key is the public-id and the value is the node that was changed in this file
+     * @param _entities A map where the key is the public-id and the value is the entity that was changed in this file
      */
-    private fun createDeltaFile(fileName: String, nodes: Map<String, Node>) {
+    private fun createDeltaFile(fileName: String, _entities: Map<String, Node>) {
+        if (fileName == baseFileName) {
+            return
+        }
+
+        val entities = _entities.toSortedMap()
         val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument()
         document.xmlStandalone = true
         val rootElement = document.createElement("import")
         document.appendChild(rootElement)
 
         // For each root node, create a new element under rootElement. Then iterate over its child nodes and parse them
-        nodes.forEach { node ->
-            val element = document.createElement(node.value.name)
-            node.value.attributes.forEach { att -> element.setAttribute(att.key, att.value.last().newValue) }
-            rootElement.appendChild(element)
-            node.value.children.forEach { child -> parseNode(document, fileName, child, element) }
+        entities.forEach { entity ->
+            val element = document.createElement(entity.value.name)
+            element.setAttribute("public-id", entity.value.publicId)
+
+            var shouldAdd = false
+            entity.value.children.forEach { child ->
+                if (parseNode(document, fileName, child, element)) {
+                    shouldAdd = true
+                }
+            }
+
+            if (shouldAdd) rootElement.appendChild(element)
         }
 
         // Exports the xml file
@@ -112,20 +122,15 @@ class DeltaExport(
     private fun parseNode(document: Document, fileName: String, node: Node, parent: Element): Boolean {
         val element = document.createElement(node.name)
         var shouldAdd = false
-        node.attributes.forEach { att -> element.setAttribute(att.key, att.value.last().newValue) }
-        node.valueVersions.forEach { version ->
-            if (version.fileName == fileName || (isArrayElement(node) && isAnyArrayElementChangedInThisFile(
-                    node,
-                    fileName
-                ))
-            ) {
-                val parentNode = node.parentNode
-                if (!(version.newValue == "" && version.previousVersion == null && !includeNewEmptyFields)
-                    || isArrayElement(node) || (parentNode != null && isArrayElement(parentNode) && node.attributes.isNotEmpty())
-                ) {
-                    element.textContent = version.newValue
-                    shouldAdd = true
-                }
+
+        if (node.publicId != null) {
+            element.setAttribute("public-id", node.publicId)
+        }
+
+        node.versions.forEach { version ->
+            if (shouldIncludeRegularNode(version, node, fileName) || shouldIncludeArrayNode(version, node, fileName)) {
+                element.textContent = version.value
+                shouldAdd = true
             }
         }
 
@@ -142,10 +147,29 @@ class DeltaExport(
         return shouldAdd
     }
 
+    private fun shouldIncludeRegularNode(version: Version, node: Node, fileName: String): Boolean {
+        if (version.fileName == fileName
+            && ((version.previousVersion == null && (version.value != "" || node.publicId != null))
+                    || version.previousVersion != null && version.previousVersion.value != version.value)
+        ) {
+            return true
+        }
+
+        return false
+    }
+
+    private fun shouldIncludeArrayNode(version: Version, node: Node, fileName: String): Boolean {
+        if (version.fileName == fileName && isArrayNode(node) && isOneArrayElementChanged(node, fileName)) {
+            return true
+        }
+
+        return false
+    }
+
     /**
      * Check if the current node is part of an array.
      */
-    private fun isArrayElement(node: Node): Boolean {
+    private fun isArrayNode(node: Node): Boolean {
         val parentNode = node.parentNode
         if (parentNode != null && parentNode.children.size > 1) {
             val firstChildName = parentNode.children[0].name
@@ -155,15 +179,16 @@ class DeltaExport(
         return false
     }
 
-    /**
-     * Check if any element in the current array was changed/added as part of the file name passed in. Assumes an array.
-     */
-    private fun isAnyArrayElementChangedInThisFile(node: Node, fileName: String): Boolean {
+    private fun isOneArrayElementChanged(node: Node, fileName: String): Boolean {
         val parentNode = node.parentNode
         if (parentNode != null) {
-            return parentNode.children.any { childNode ->
-                childNode.valueVersions
-                    .any { version -> version.fileName == fileName }
+            return parentNode.children.any { arrayElement ->
+                arrayElement.children.any { child ->
+                    child.versions.any { version ->
+                        version.fileName == fileName
+                                && (version.previousVersion == null || version.previousVersion.value != version.value)
+                    }
+                }
             }
         }
 
